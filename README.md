@@ -1,4 +1,4 @@
-# Gravbit
+# bit-floor
 
 > Purely experimental. 1-bit and 1.58-bit quantization-native LLM inference in Rust + CUDA — weights that are never dequantized, matrix multiply that is literally just XNOR and popcount.
 
