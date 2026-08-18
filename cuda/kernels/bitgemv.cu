@@ -33,7 +33,8 @@ __global__ void bitgemv_1bit(
     float           w_scale,
     float           x_scale,
     int             N,
-    int             K_words)
+    int             K_words,
+    int             K)
 {
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane    = threadIdx.x % WARP_SIZE;
@@ -54,8 +55,18 @@ __global__ void bitgemv_1bit(
     accum = warp_reduce_sum_int(accum);
 
     if (lane == 0) {
-        int K   = K_words * 64;
-        float dot = (float)(2 * accum - K);
+        // K_words*64 counts the packed word capacity, which is >= the real
+        // row width K whenever K isn't a multiple of 64. The unused tail
+        // bits in both W_packed and x_packed are always 0 by construction
+        // (see pack.rs / quantise_activation), and xnor64(0, 0) == ~0,
+        // i.e. every padding bit is popcounted as a spurious "agreement".
+        // There are exactly (K_words*64 - K) such phantom agreements per
+        // row; subtract them out of accum before applying the
+        // 2*popcount - K formula so this matches the true, unpadded dot
+        // product for any K, not just multiples of 64.
+        int pad_bits         = K_words * 64 - K;
+        int accum_corrected  = accum - pad_bits;
+        float dot = (float)(2 * accum_corrected - K);
         atomicAdd(&y[row], w_scale * x_scale * dot);
     }
 }
@@ -80,6 +91,10 @@ __global__ void bitgemv_ternary(
     const uint64_t* wm = W_mag  + (size_t)row * K_words;
     const uint64_t* ws = W_sign + (size_t)row * K_words;
 
+    // No padding correction needed here: W_mag's padding bits are always 0
+    // by construction, and every term below is gated through "& mag", so
+    // padding word positions contribute exactly 0 to `dot` regardless of
+    // K vs K_words*64.
     int dot = 0;
 #pragma unroll 4
     for (int w = lane; w < K_words; w += WARP_SIZE) {
@@ -117,12 +132,13 @@ extern "C" void launch_bitgemv_1bit(
     float           x_scale,
     int             N,
     int             K_words,
+    int             K,
     cudaStream_t    stream)
 {
     dim3 grid((N + TILE_M - 1) / TILE_M);
     dim3 block(THREADS_PER_CTA);
     bitgemv_1bit<<<grid, block, 0, stream>>>(
-        W_packed, x_packed, y, w_scale, x_scale, N, K_words);
+        W_packed, x_packed, y, w_scale, x_scale, N, K_words, K);
 }
 
 extern "C" void launch_bitgemv_ternary(
