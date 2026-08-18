@@ -23,9 +23,21 @@ fn binary_gemv(w: &PackedMatrix, x_packed: &[u64], x_scale: f32, y: &mut [f32]) 
     let total_bits     = w.cols as i64;
     let combined_scale = w.scale * x_scale;
 
+    // When `cols` isn't a multiple of 64, the last packed word has unused
+    // "padding" bits. Both the weight row and the activation leave those
+    // padding bits as 0 (see pack.rs / quantise_activation), and
+    // XNOR(0, 0) = 1 — so every padding bit is silently counted as an
+    // "agreement" bit by dot_binary(). There are exactly
+    // `words_per_row*64 - cols` such phantom agreements in every row's
+    // raw popcount total; subtract them out before applying the
+    // 2*popcount - K formula so the result matches the true, unpadded
+    // dot product regardless of row width.
+    let pad_bits = (k as i64) * 64 - total_bits;
+
     y.par_iter_mut().enumerate().for_each(|(row, out)| {
         let w_row = &w.mag[row * k..(row + 1) * k];
-        let dot   = dot_binary(w_row, x_packed) as i64;
+        let raw   = dot_binary(w_row, x_packed) as i64;
+        let dot   = raw - pad_bits;
         *out += combined_scale * (2 * dot - total_bits) as f32;
     });
 }
@@ -34,6 +46,11 @@ fn ternary_gemv(w: &PackedMatrix, x_packed: &[u64], x_scale: f32, y: &mut [f32])
     let k              = w.words_per_row;
     let combined_scale = w.scale * x_scale;
 
+    // No padding correction needed here: `mag`'s padding bits are always 0
+    // by construction (pack_row only ever sets bits for real columns), and
+    // dot_ternary gates every popcount through `& mag`, so padding
+    // positions contribute exactly 0 regardless of what the activation's
+    // padding bits are.
     y.par_iter_mut().enumerate().for_each(|(row, out)| {
         let mag_row  = &w.mag [row * k..(row + 1) * k];
         let sign_row = &w.sign[row * k..(row + 1) * k];
@@ -121,6 +138,8 @@ unsafe fn dot_ternary_avx2(mag: &[u64], sign: &[u64], x: &[u64]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quantization::pack::BitPacking;
+    use crate::quantization::{PackedMatrix, QuantMode};
 
     #[test]
     fn binary_dot_all_agree() {
@@ -135,4 +154,40 @@ mod tests {
         let x = vec![0x0000000000000000_u64; 1];
         assert_eq!(dot_binary_scalar(&w, &x), 0);
     }
-}
+
+    // Regression test for the padding-bit contamination bug: cols is
+    // deliberately NOT a multiple of 64 (100 = 1 full word + 36 bits of
+    // padding). Before the fix, the padding bits' spurious XNOR
+    // "agreements" would inflate the result.
+    #[test]
+    fn binary_gemv_non_aligned_cols_matches_naive_dot() {
+        let rows = 3;
+        let cols = 100;
+
+        // Deterministic pseudo-random-ish +1/-1 pattern.
+        let w_data: Vec<f32> = (0..rows * cols)
+            .map(|i| if (i * 2654435761u32.wrapping_add(i as u32)) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let x_data: Vec<f32> = (0..cols)
+            .map(|i| if (i * 40503) % 3 == 0 { -1.0 } else { 1.0 })
+            .collect();
+
+        let packed = PackedMatrix::pack_f32(&w_data, rows, cols, QuantMode::Binary).unwrap();
+        let (x_packed, x_scale) = crate::quantization::scale::quantise_activation(&x_data);
+
+        let mut y = vec![0.0f32; rows];
+        bitgemv_cpu(&packed, &x_packed, x_scale, &mut y);
+
+        for row in 0..rows {
+            let expected: f32 = (0..cols)
+                .map(|c| w_data[row * cols + c] * x_data[c])
+                .sum::<f32>();
+            assert!(
+                (y[row] - expected).abs() < 1e-1,
+                "row {}: got {}, expected ~{}",
+                row, y[row], expected
+            );
+        }
+    }
+                     }
+
