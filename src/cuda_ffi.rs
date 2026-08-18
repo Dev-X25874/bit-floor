@@ -14,6 +14,7 @@ extern "C" {
         x_scale:  f32,
         N:        i32,
         K_words:  i32,
+        K:        i32,
         stream:   *mut c_void,
     );
 
@@ -123,6 +124,12 @@ pub fn linear_forward_cuda(
     let w       = &lw.weight;
     let n       = w.rows as i32;
     let k_words = w.words_per_row as i32;
+    // Real (unpadded) row width. bitgemv_1bit needs this in addition to
+    // k_words to correct for the XNOR-padding contamination described in
+    // bitgemv.cu — the last packed word may contain unused bits beyond
+    // the true column count, and those are otherwise miscounted as
+    // "agreements" by the popcount/XNOR formula.
+    let k       = w.cols as i32;
     let stream  = std::ptr::null_mut();
 
     let gpu_mag = GpuBuffer::alloc(w.mag_bytes())?;
@@ -139,7 +146,7 @@ pub fn linear_forward_cuda(
             QuantMode::Binary => {
                 launch_bitgemv_1bit(
                     gpu_mag.as_ptr(), gpu_x.as_ptr(), gpu_y.as_mut_ptr(),
-                    w.scale, x_scale, n, k_words, stream,
+                    w.scale, x_scale, n, k_words, k, stream,
                 );
             }
             QuantMode::Ternary => {
@@ -158,4 +165,5 @@ pub fn linear_forward_cuda(
     y = bytemuck::cast_slice(&y_bytes).to_vec();
 
     Ok(y)
-}
+                    }
+
