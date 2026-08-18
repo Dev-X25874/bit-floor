@@ -112,24 +112,41 @@ fn top_p_sample(probs: &[f32], p: f32) -> u32 {
         .collect();
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    let mut cumsum = 0.0f32;
-    // Draw a uniform sample in [0, 1); stop when the cumulative probability
-    // of the nucleus prefix first exceeds it.  p just controls the *size*
-    // of the nucleus (we stop filling it early once cumsum >= p), not the
-    // sampling threshold itself.
-    let u = rand_f32();
+    let p = p.clamp(0.0, 1.0);
 
-    for (idx, prob) in &indexed {
+    // Find the nucleus: the smallest prefix (in descending-probability
+    // order) whose cumulative mass is >= p. Always keep at least one
+    // token, even if its own probability already exceeds p.
+    let mut nucleus_end = indexed.len();
+    let mut cumsum = 0.0f32;
+    for (i, (_, prob)) in indexed.iter().enumerate() {
         cumsum += prob;
-        if cumsum >= u {
-            return *idx as u32;
-        }
-        // Hard nucleus cutoff: don't sample below the p-th percentile.
-        if cumsum >= p.min(1.0) {
+        if cumsum >= p {
+            nucleus_end = i + 1;
             break;
         }
     }
-    indexed.last().map(|(i, _)| *i as u32).unwrap_or(0)
+    let nucleus = &indexed[..nucleus_end];
+
+    // Renormalize: sample uniformly over the nucleus's own probability
+    // mass, not over the full [0, 1) range. (The previous version drew u
+    // over the full range and, whenever u exceeded p — which happens
+    // ~(1-p) of the time — fell through to always returning the single
+    // lowest-probability token in the entire distribution instead of
+    // sampling within the nucleus at all.)
+    let nucleus_mass: f32 = nucleus.iter().map(|(_, prob)| prob).sum();
+    let u = rand_f32() * nucleus_mass;
+
+    let mut acc = 0.0f32;
+    for (idx, prob) in nucleus {
+        acc += prob;
+        if acc >= u {
+            return *idx as u32;
+        }
+    }
+    // Floating-point edge case (rounding at the boundary): fall back to
+    // the least-probable token *within the nucleus*, not the global tail.
+    nucleus.last().map(|(i, _)| *i as u32).unwrap_or(0)
 }
 
 fn rand_f32() -> f32 {
@@ -147,3 +164,28 @@ fn rand_f32() -> f32 {
     // Map to [0, 1) by taking the upper 53 bits (avoids float precision issues).
     (s >> 11) as f32 / (1u64 << 53) as f32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_p_never_picks_below_nucleus_when_full_mass_excluded() {
+        // A sharply peaked distribution: top_p=0.9 nucleus should only ever
+        // contain the first couple of tokens, never the near-zero tail.
+        let probs = vec![0.85f32, 0.10, 0.03, 0.01, 0.01];
+        for _ in 0..2000 {
+            let idx = top_p_sample(&probs, 0.9);
+            assert!(idx <= 1, "sampled idx {} outside the 0.9 nucleus", idx);
+        }
+    }
+
+    #[test]
+    fn top_p_one_returns_any_valid_index() {
+        let probs = vec![0.4f32, 0.3, 0.2, 0.1];
+        for _ in 0..500 {
+            let idx = top_p_sample(&probs, 1.0);
+            assert!((idx as usize) < probs.len());
+        }
+    }
+        }
